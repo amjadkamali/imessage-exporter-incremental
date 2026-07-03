@@ -12,8 +12,11 @@ a number AND an email produces two files. This tool regroups them by contact.
 
 HOW GROUPING IS DECIDED:
 Each 1:1 export file is named by its handle (e.g. +15555555555.html). We take
-that filename handle, normalize it (digits-only last-10 for phones, lowercased
-for emails), and look it up in the macOS Address Book (AddressBook-v22.abcddb).
+that filename handle, normalize it (digits-only, with the optional leading
+North American "1" country code folded off so "+15551234567" and
+"5551234567" match; international numbers are kept in full rather than
+truncated, so numbers from different countries never collide; emails are
+lowercased), and look it up in the macOS Address Book (AddressBook-v22.abcddb).
 Files whose handles resolve to the same contact record are merged together.
 A file whose handle matches no contact is kept as its own standalone output.
 
@@ -82,7 +85,18 @@ def norm_phone(s):
         # senders as if they were all the same contact. Use the sender's
         # own text as its identity instead, exactly like an email handle.
         return (s or "").strip().lower()
-    return d[-10:] if len(d) >= 10 else d   # last 10 digits = canonical key
+    # Strip a redundant leading North American country code -- "+15551234567"
+    # and "5551234567" are the same real person, commonly written both ways,
+    # so folding that specific case together is correct. Every OTHER number
+    # is used in full rather than truncated to a fixed last-10-digits
+    # window: a UK, German, or other international number blindly cut down
+    # to its last 10 digits loses exactly the part of the number that
+    # distinguishes it from someone else's, and two unrelated contacts from
+    # different countries can end up with the same truncated key -- silently
+    # merging them as if they were one person.
+    if len(d) == 11 and d[0] == "1":
+        return d[1:]
+    return d
 
 def norm_email(s):
     return (s or "").strip().lower()
