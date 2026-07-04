@@ -366,14 +366,37 @@ if len(candidates) == 1:
     sys.exit(0)
 
 shutil.copy2(candidates[0], out_path)
+# Also copy the base file's own WAL/SHM sidecars, if the earlier refresh
+# step copied them alongside it from a live source. A continuously-running
+# database (the real macOS Address Book daemon never closes its
+# connection) can have its most recently written data sitting only in the
+# WAL, not yet checkpointed into the main file -- copying just the main
+# file without these would silently produce a merged output missing
+# whatever hadn't been checkpointed yet, an easy thing to miss since it
+# wouldn't error, just quietly work from stale data.
+for suffix in ("-wal", "-shm"):
+    src_sidecar = Path(str(candidates[0]) + suffix)
+    if src_sidecar.is_file():
+        shutil.copy2(src_sidecar, Path(str(out_path) + suffix))
+
 con = sqlite3.connect(out_path)
-con.execute("ATTACH DATABASE ? AS src", (str(candidates[0]),))
+# Read-only URI attach, not a plain path: SQLite checkpoints (and deletes)
+# a WAL-mode database's own -wal/-shm sidecars as a normal side effect of
+# ATTACH+DETACH, even for a pure read-only SELECT that never writes
+# anything itself. Confirmed directly: attaching to a copied file with a
+# plain (non-read-only) ATTACH silently checkpoints and removes its
+# -wal/-shm files entirely, purely from being queried. These files were
+# only ever meant to be READ here, never modified -- doing so is a
+# regression this merge step introduced that the old plain-`cp`-only
+# refresh logic never had, since it never opened these files with SQLite
+# at all.
+con.execute("ATTACH DATABASE ? AS src", ("file:" + str(candidates[0]) + "?mode=ro",))
 max_pk = con.execute("SELECT COALESCE(MAX(Z_PK), 0) FROM ZABCDRECORD").fetchone()[0]
 con.execute("DETACH DATABASE src")
 
 offset = max(max_pk, 0) + 1000000
 for i, src_path in enumerate(candidates[1:], start=1):
-    con.execute("ATTACH DATABASE ? AS src", (str(src_path),))
+    con.execute("ATTACH DATABASE ? AS src", ("file:" + str(src_path) + "?mode=ro",))
     this_offset = offset * i
     con.execute(f"""
         INSERT INTO main.ZABCDRECORD (Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION)
@@ -495,7 +518,18 @@ for f in sorted(run_dir.glob('*.html')):
     if not is_group_filename(f.name):
         continue
     text = f.read_text(encoding='utf-8', errors='replace')
-    guids = re.findall(r'message-guid=([A-F0-9a-f-]+)', text)[:5]
+    all_guids = re.findall(r'message-guid=([A-F0-9a-f-]+)', text)
+    # Try the most RECENT messages first (end of file -- exports are
+    # written chronologically), falling back to the oldest ones only if
+    # none of the recent ones correlate. For a long-running, high-volume
+    # group especially, the oldest messages in the file are the ones most
+    # likely to have aged out of a CURRENT chat.db snapshot (macOS's own
+    # "Messages in iCloud" feature offloads older messages from local
+    # storage over time) -- trying oldest-first, as an earlier version of
+    # this script did, meant exactly the least reliable messages got
+    # tried, even though later ones in the very same file might have
+    # resolved fine.
+    guids = list(reversed(all_guids))[:10] + all_guids[:5]
     participants = participants_for_guids(con, guids)
     if participants:
         result[f.name] = participants
