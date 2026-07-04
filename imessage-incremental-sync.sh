@@ -168,13 +168,22 @@ fi
 trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
 
 # ---- compute the export window ----------------------------------------------
-# End date is EXCLUSIVE in imessage-exporter, so "tomorrow" captures all of
-# today. Start date is (date of the last completed snapshot - 1 day): the
+# No end date at all: the export runs against a frozen SNAPSHOT of chat.db,
+# which by definition can never contain a message timestamped after the
+# moment the snapshot was taken. An upper bound couldn't exclude anything
+# even if given one -- there's nothing in a frozen snapshot that ever
+# exceeds "now" for it to cut off. Only -s (start date) is meaningful here.
+#
+# Start date is (date of the last completed snapshot - 1 day): the
 # requested one-day overlap buffer, so a message right at yesterday's
-# boundary can never be missed -- any overlap that lands in the same file as
-# a previous run just dedupes away at index time in the app now, rather than
-# during a merge step here.
-END_DATE="$(date -v+1d +%Y-%m-%d)"
+# boundary can never be missed. This matters more than a same-machine
+# same-timezone analysis alone suggests: if the Mac's system timezone
+# changes between runs (traveling, not just DST), a date boundary computed
+# under one timezone doesn't reliably land the same way once the next run
+# filters under a different one -- the extra day of margin absorbs that
+# shift instead of risking a silently missed message right at the edge.
+# Any overlap that lands in the same file as a previous run just dedupes
+# away at index time in the app now, rather than during a merge step here.
 
 # Find the most recent COMPLETED snapshot -- its name IS the state, no
 # separate file to track or drift out of sync with reality. Only folders
@@ -205,7 +214,7 @@ else
 fi
 
 echo "==> Plan:"
-echo "      window:       ${START_DATE:-<full history>}  ..  ${END_DATE} (exclusive)"
+echo "      window:       ${START_DATE:-<full history>}  onward (no end date)"
 echo "      output:       ${RUN_DIR}"
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -250,9 +259,9 @@ echo "    using snapshot: ${SNAP_DIR}/chat.db"
 # second, imessage-exporter always starts writing into a brand new, empty
 # folder, full stop.
 echo
-echo "==> [2/2] Exporting messages (${START_DATE:-<full history>} .. ${END_DATE}) into ${RUN_DIR}..."
+echo "==> [2/2] Exporting messages (${START_DATE:-<full history>} onward) into ${RUN_DIR}..."
 mkdir -p "${RUN_DIR}"
-EXPORTER_ARGS=(-f html -c disabled -p "${SNAP_DIR}/chat.db" -r "${LIVE_ARCHIVE}" -a macOS -e "${END_DATE}" -o "${RUN_DIR}")
+EXPORTER_ARGS=(-f html -c disabled -p "${SNAP_DIR}/chat.db" -r "${LIVE_ARCHIVE}" -a macOS -o "${RUN_DIR}")
 if [[ -n "${START_DATE}" ]]; then
   EXPORTER_ARGS+=(-s "${START_DATE}")
 fi
@@ -287,7 +296,6 @@ PYEOF
 # specific "which snapshot completed this" bookkeeping still belongs here.
 {
   echo "start=${START_DATE:-<full history>}"
-  echo "end=${END_DATE}"
   echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "${SNAP_DIR}/.complete"
 
