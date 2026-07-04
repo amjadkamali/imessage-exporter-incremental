@@ -276,8 +276,20 @@ mkdir -p "${ADDRESSBOOK_CACHE_DIR}"
 
 _refresh_one_addressbook_source() {
   local src="$1" dest="$2" tmp="${2}.tmp.$$"
-  [[ -r "${src}" ]] || return 1
+  # No -r pre-check here on purpose: bash's -r test on macOS reflects
+  # ordinary Unix permission bits, and it's not fully clear that reflects
+  # whether TCC would actually block the real read -- TCC enforcement
+  # generally happens at the actual open()/read() syscall level, not the
+  # permission-bit level a lightweight check like that inspects. Relying
+  # solely on cp's own exit code below means the thing actually being
+  # trusted is a genuine attempt at the real read, not a proxy for it.
   cp "${src}" "${tmp}" 2>/dev/null || { rm -f "${tmp}"; return 1; }
+  # Belt and suspenders: a real Address Book database is never legitimately
+  # empty, so if cp somehow exited 0 without actually transferring
+  # anything (an edge case, not the expected failure mode, but cheap to
+  # guard against), treat that the same as an outright failure rather than
+  # promoting a zero-byte file into the cache.
+  [[ -s "${tmp}" ]] || { rm -f "${tmp}"; return 1; }
   [[ -f "${src}-wal" ]] && cp "${src}-wal" "${tmp}-wal" 2>/dev/null
   [[ -f "${src}-shm" ]] && cp "${src}-shm" "${tmp}-shm" 2>/dev/null
   mv "${tmp}" "${dest}"
