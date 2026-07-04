@@ -325,21 +325,80 @@ shopt -u nullglob
 # inside the synced folder rather than being duplicated into a copy that
 # only exists on this Mac.
 #
-# -n points imessage-exporter at the SAME cached Address Book copy step 2
-# just refreshed, instead of letting it fall back to its own automatic
-# detection of the live system path -- which would hit the identical TCC
-# restriction on an automated run that everything else here already works
-# around. Only added if that cache file actually exists yet (e.g. this
-# could be the very first run, before anything has ever successfully
-# refreshed it); if it doesn't, this is simply omitted and imessage-exporter
-# falls back to its own default behavior, exactly as before this change.
+# -n points imessage-exporter at a cached Address Book copy from step 2,
+# instead of letting it fall back to its own automatic detection of the
+# live system path -- which would hit the identical TCC restriction on an
+# automated run that everything else here already works around.
 #
-# Output goes directly into RUN_DIR, timestamped the same way as the DB
-# snapshot -- no separate staging/exports folder anymore, and no reliance
-# on imessage-exporter's own append-vs-overwrite behavior for an
-# already-populated directory either: since RUN_DIR is unique to the
-# second, imessage-exporter always starts writing into a brand new, empty
-# folder, full stop.
+# -n only accepts ONE file, but most Macs split contacts across the main
+# local Address Book AND a separate file per iCloud/Exchange account
+# under Contacts/Sources/*/ -- and since iCloud Contacts sync is the
+# default, most real contacts usually live in a Sources/* file, NOT the
+# main one. Pointing -n at just the main file (an earlier version of this
+# script did exactly that) means imessage-exporter silently can't resolve
+# anyone whose only record is in a Sources/* file -- not an error, just
+# quietly falling back to raw handles for them, which is very easy to
+# mistake for the address book not working at all. The step below
+# combines every source into one file first, so -n gets the complete
+# picture instead of an arbitrary fraction of it.
+echo
+echo "==> Combining Address Book sources for imessage-exporter..."
+MERGED_ADDRESSBOOK="$(python3 - "${ADDRESSBOOK_CACHE_DIR}" <<'PYEOF'
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+
+cache_dir = Path(sys.argv[1])
+out_path = cache_dir / "Merged-AddressBook-v22.abcddb"
+
+candidates = []
+main = cache_dir / "AddressBook-v22.abcddb"
+if main.is_file():
+    candidates.append(main)
+candidates.extend(sorted(cache_dir.glob("Sources/*/AddressBook-v22.abcddb")))
+
+if not candidates:
+    # Nothing to print -- caller checks for an empty result.
+    sys.exit(0)
+if len(candidates) == 1:
+    print(candidates[0])
+    sys.exit(0)
+
+shutil.copy2(candidates[0], out_path)
+con = sqlite3.connect(out_path)
+con.execute("ATTACH DATABASE ? AS src", (str(candidates[0]),))
+max_pk = con.execute("SELECT COALESCE(MAX(Z_PK), 0) FROM ZABCDRECORD").fetchone()[0]
+con.execute("DETACH DATABASE src")
+
+offset = max(max_pk, 0) + 1000000
+for i, src_path in enumerate(candidates[1:], start=1):
+    con.execute("ATTACH DATABASE ? AS src", (str(src_path),))
+    this_offset = offset * i
+    con.execute(f"""
+        INSERT INTO main.ZABCDRECORD (Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION)
+        SELECT Z_PK + {this_offset}, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION FROM src.ZABCDRECORD
+    """)
+    con.execute(f"""
+        INSERT INTO main.ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER)
+        SELECT ZOWNER + {this_offset}, ZFULLNUMBER FROM src.ZABCDPHONENUMBER
+    """)
+    con.execute(f"""
+        INSERT INTO main.ZABCDEMAILADDRESS (ZOWNER, ZADDRESS)
+        SELECT ZOWNER + {this_offset}, ZADDRESS FROM src.ZABCDEMAILADDRESS
+    """)
+    con.commit()
+    con.execute("DETACH DATABASE src")
+con.close()
+print(out_path)
+PYEOF
+)"
+if [[ -n "${MERGED_ADDRESSBOOK}" ]]; then
+  echo "    using: ${MERGED_ADDRESSBOOK}"
+else
+  echo "    no address book source available yet; contact-name resolution will be skipped for this run"
+fi
+
 echo
 echo "==> [3/3] Exporting messages (${START_DATE:-<full history>} onward) into ${RUN_DIR}..."
 mkdir -p "${RUN_DIR}"
@@ -347,8 +406,8 @@ EXPORTER_ARGS=(-f html -c disabled -p "${SNAP_DIR}/chat.db" -r "${LIVE_ARCHIVE}"
 if [[ -n "${START_DATE}" ]]; then
   EXPORTER_ARGS+=(-s "${START_DATE}")
 fi
-if [[ -f "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb" ]]; then
-  EXPORTER_ARGS+=(-n "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb")
+if [[ -n "${MERGED_ADDRESSBOOK}" ]]; then
+  EXPORTER_ARGS+=(-n "${MERGED_ADDRESSBOOK}")
 fi
 imessage-exporter "${EXPORTER_ARGS[@]}"
 
@@ -386,6 +445,69 @@ PYEOF
 
 RAW_COUNT="$(find "${RUN_DIR}" -maxdepth 1 -name '*.html' | wc -l | tr -d ' ')"
 echo "    ${RAW_COUNT} file(s) in ${RUN_DIR}"
+
+# ---- extract real participant lists for group chats, from chat.db itself --
+# imessage-exporter has no feature for this -- its filenames carry a custom
+# name or a comma-separated handle list, but a NAMED group's filename has
+# no participant information in it at all. chat.db itself does, though,
+# via the chat_handle_join table, which this app has no other reason to
+# touch. Correlated back to each exported FILE by its own message GUIDs
+# (already embedded in the HTML) rather than by name or by whatever number
+# imessage-exporter appends to disambiguate a collision -- the exact
+# meaning of that number isn't confirmed, so this deliberately doesn't
+# depend on it. This is purely descriptive data for display (see the web
+# app's contact-info panel) -- it is NOT used to decide which files merge
+# into one conversation, and deliberately so: chat_handle_join reflects
+# CURRENT membership only, and people get added to and removed from a
+# group over time, so requiring participant-set agreement before merging
+# would incorrectly split the same real, ongoing group the moment anyone's
+# membership ever changed.
+echo
+echo "==> Extracting group participant lists from chat.db..."
+python3 - "${RUN_DIR}" "${SNAP_DIR}/chat.db" <<'PYEOF'
+import json, re, sqlite3, sys
+from pathlib import Path
+
+run_dir, db_path = Path(sys.argv[1]), sys.argv[2]
+
+def is_group_filename(name):
+    stem = Path(name).stem
+    return ',' in stem or ' ' in stem
+
+def participants_for_guids(con, guids):
+    for guid in guids:
+        row = con.execute(
+            "SELECT cmj.chat_id FROM message m "
+            "JOIN chat_message_join cmj ON m.ROWID = cmj.message_id "
+            "WHERE m.guid = ? LIMIT 1", (guid,)
+        ).fetchone()
+        if row:
+            return sorted(r[0] for r in con.execute(
+                "SELECT h.id FROM chat_handle_join chj "
+                "JOIN handle h ON chj.handle_id = h.ROWID "
+                "WHERE chj.chat_id = ?", (row[0],)
+            ))
+    return None
+
+con = sqlite3.connect(db_path)
+result = {}
+for f in sorted(run_dir.glob('*.html')):
+    if not is_group_filename(f.name):
+        continue
+    text = f.read_text(encoding='utf-8', errors='replace')
+    guids = re.findall(r'message-guid=([A-F0-9a-f-]+)', text)[:5]
+    participants = participants_for_guids(con, guids)
+    if participants:
+        result[f.name] = participants
+con.close()
+
+out_path = run_dir / 'group_participants.json'
+if result:
+    out_path.write_text(json.dumps(result, indent=2))
+    print(f"    wrote participant data for {len(result)} group(s)")
+else:
+    print("    no group participant data resolved this run (nothing to write)")
+PYEOF
 
 # ---- attachments: handled entirely by step 1 -------------------------------
 # With -c disabled, imessage-exporter references attachments in place rather
