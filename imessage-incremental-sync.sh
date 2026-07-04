@@ -459,7 +459,68 @@ else
       MY_HANDLE_ARGS+=(--my-handle "${h}")
     done
 
-    "${PYTHON_BIN}" "${MERGE_BY_CONTACT}" -o "${ARCHIVE_STAGING}" "${MY_HANDLE_ARGS[@]}" "${INPUT_FILES[@]}"
+    # Refresh the Address Book cache in WorkingDir from the live system
+    # copy whenever this process can actually read it, then always use
+    # whatever ends up in the cache (freshly updated or not) for the
+    # merge. The live path is TCC-protected: when this script is run by
+    # the automated launchd job, the read below will always fail, since
+    # Contacts access has no manual-grant path the way Full Disk Access
+    # does -- it can only be granted through the system's own runtime
+    # consent prompt for an actual Contacts API call, which a plain file
+    # read like this never triggers. That failure is expected and
+    # harmless here: it just means this run keeps using whatever was
+    # cached last time. Whenever this script instead gets run with
+    # access (e.g. manually from Terminal, which already has whatever
+    # access you use Contacts.app with), the refresh below succeeds and
+    # the cache gets updated as a side effect, with no separate step
+    # needed.
+    ADDRESSBOOK_CACHE_DIR="${WORKING_DIR}/addressbook-cache"
+    mkdir -p "${ADDRESSBOOK_CACHE_DIR}"
+
+    _refresh_one_addressbook_source() {
+      local src="$1" dest="$2" tmp="${2}.tmp.$$"
+      [[ -r "${src}" ]] || return 1
+      cp "${src}" "${tmp}" 2>/dev/null || { rm -f "${tmp}"; return 1; }
+      [[ -f "${src}-wal" ]] && cp "${src}-wal" "${tmp}-wal" 2>/dev/null
+      [[ -f "${src}-shm" ]] && cp "${src}-shm" "${tmp}-shm" 2>/dev/null
+      mv "${tmp}" "${dest}"
+      [[ -f "${tmp}-wal" ]] && mv "${tmp}-wal" "${dest}-wal"
+      [[ -f "${tmp}-shm" ]] && mv "${tmp}-shm" "${dest}-shm"
+      return 0
+    }
+
+    ADDRESSBOOK_SRC_BASE="$HOME/Library/Application Support/AddressBook"
+    if _refresh_one_addressbook_source \
+         "${ADDRESSBOOK_SRC_BASE}/AddressBook-v22.abcddb" \
+         "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb"; then
+      echo "    refreshed address book cache from system"
+    else
+      echo "    could not read system address book directly (expected on automated runs); using cached copy if available"
+    fi
+    shopt -s nullglob
+    for ab_src in "${ADDRESSBOOK_SRC_BASE}/Sources"/*/AddressBook-v22.abcddb; do
+      ab_source_id=$(basename "$(dirname "${ab_src}")")
+      mkdir -p "${ADDRESSBOOK_CACHE_DIR}/Sources/${ab_source_id}"
+      _refresh_one_addressbook_source \
+        "${ab_src}" "${ADDRESSBOOK_CACHE_DIR}/Sources/${ab_source_id}/AddressBook-v22.abcddb"
+    done
+    shopt -u nullglob
+
+    ADDRESSBOOK_ARGS=()
+    if [[ -f "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb" ]]; then
+      ADDRESSBOOK_ARGS+=(--addressbook "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb")
+    fi
+    if [[ -d "${ADDRESSBOOK_CACHE_DIR}/Sources" ]]; then
+      while IFS= read -r -d '' f; do
+        ADDRESSBOOK_ARGS+=(--addressbook "${f}")
+      done < <(find "${ADDRESSBOOK_CACHE_DIR}/Sources" -name 'AddressBook-v22.abcddb' -print0)
+    fi
+    if [[ "${#ADDRESSBOOK_ARGS[@]}" -eq 0 ]]; then
+      echo "    no address book cache available yet; contact-name resolution will be skipped for this run"
+      echo "    (this resolves itself automatically the first time this script runs with system access, e.g. manually from Terminal)"
+    fi
+
+    "${PYTHON_BIN}" "${MERGE_BY_CONTACT}" -o "${ARCHIVE_STAGING}" "${MY_HANDLE_ARGS[@]}" "${ADDRESSBOOK_ARGS[@]}" "${INPUT_FILES[@]}"
 
     # Back up the OLD state (a COPY, not a move -- the live files stay put
     # and get updated in place just below) before anything in
