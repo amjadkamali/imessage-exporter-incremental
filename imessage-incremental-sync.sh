@@ -478,8 +478,7 @@ else
       mkdir -p "${BACKUP_DIR}"
       find "${LIVE_ARCHIVE}" -maxdepth 1 -name '*.html' -exec cp {} "${BACKUP_DIR}/" \;
       echo "    previous archive's HTML backed up to: ${BACKUP_DIR}"
-      echo "    (no attachments in the backup -- the live \"iMessageExports\" folder"
-      echo "     is the only copy with working images)"
+      echo "    (no attachments in the backup -- the live \"iMessageExports\" folder is the only copy with working images)"
     fi
     mkdir -p "${LIVE_ARCHIVE}"
     # Update each file's CONTENT in place (same path, same inode) rather
@@ -506,6 +505,9 @@ else
     # correct: if staging's output is byte-identical to what's already
     # live, skip the write (and the mtime touch) entirely -- zero disk I/O,
     # zero sync activity, for threads that genuinely didn't change.
+
+    echo "==> Migrating updated files to ${LIVE_ARCHIVE}."
+
     STAGED_NAMES=()
     for f in "${ARCHIVE_STAGING}"/*.html; do
       [[ -e "${f}" ]] || continue
