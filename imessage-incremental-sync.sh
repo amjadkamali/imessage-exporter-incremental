@@ -224,7 +224,7 @@ fi
 
 # ---- step 1: read-only DB snapshot + synced attachments ---------------------
 echo
-echo "==> [1/2] Snapshotting chat.db (read-only) and syncing attachments..."
+echo "==> [1/3] Snapshotting chat.db (read-only) and syncing attachments..."
 # Second argument tells imessage-snapshot.sh to put the shared
 # Attachments/StickerCache stores directly inside "iMessageExports" itself,
 # rather than alongside the dated DB snapshots. That's what lets -c disabled
@@ -242,7 +242,68 @@ if [[ -z "${SNAP_DIR}" || ! -f "${SNAP_DIR}/chat.db" ]]; then
 fi
 echo "    using snapshot: ${SNAP_DIR}/chat.db"
 
-# ---- step 2: export straight into this run's own timestamped folder --------
+# ---- step 2: refresh the Address Book cache, BEFORE exporting ---------------
+# Done before the export runs (not after) specifically so imessage-exporter
+# itself can be pointed at this same local copy via -n/--contacts-path
+# below, rather than relying on its own automatic detection of the live
+# system path. imessage-exporter does its own contact-name resolution
+# during export (populating sender names in the HTML it writes), and that
+# resolution is subject to the exact same TCC restriction as everything
+# else in this pipeline that touches Contacts -- when this script runs via
+# the automated launchd job, imessage-exporter's own attempt to read the
+# live Address Book would silently fail too, for the identical reason
+# nothing else here can get a manual grant for Contacts access. Handing it
+# an explicit, already-cached, ordinary file to read sidesteps that
+# entirely, the same way the web app's own indexer does.
+#
+# This cache also lives inside "iMessageExports/Contacts" so it's visible
+# from the same mounted volume the web app's container already reads
+# ARCHIVE_ROOT from -- point its ADDRESSBOOK_CACHE_DIR at this same path
+# and it picks this up with no separate mount needed.
+#
+# Refreshed from the live system copy whenever this process can actually
+# read it, then whatever ends up in the cache (freshly updated or not) is
+# used either way -- by imessage-exporter just below, and later by the web
+# app when it next indexes. That live-system read is expected to fail on
+# automated runs and succeed whenever this script is run with access (e.g.
+# manually from Terminal, which already has whatever access you use
+# Contacts.app with); either way, this step always leaves something usable
+# in place if anything has ever succeeded before.
+echo
+echo "==> [2/3] Refreshing Address Book cache..."
+ADDRESSBOOK_CACHE_DIR="${LIVE_ARCHIVE}/Contacts"
+mkdir -p "${ADDRESSBOOK_CACHE_DIR}"
+
+_refresh_one_addressbook_source() {
+  local src="$1" dest="$2" tmp="${2}.tmp.$$"
+  [[ -r "${src}" ]] || return 1
+  cp "${src}" "${tmp}" 2>/dev/null || { rm -f "${tmp}"; return 1; }
+  [[ -f "${src}-wal" ]] && cp "${src}-wal" "${tmp}-wal" 2>/dev/null
+  [[ -f "${src}-shm" ]] && cp "${src}-shm" "${tmp}-shm" 2>/dev/null
+  mv "${tmp}" "${dest}"
+  [[ -f "${tmp}-wal" ]] && mv "${tmp}-wal" "${dest}-wal"
+  [[ -f "${tmp}-shm" ]] && mv "${tmp}-shm" "${dest}-shm"
+  return 0
+}
+
+ADDRESSBOOK_SRC_BASE="$HOME/Library/Application Support/AddressBook"
+if _refresh_one_addressbook_source \
+     "${ADDRESSBOOK_SRC_BASE}/AddressBook-v22.abcddb" \
+     "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb"; then
+  echo "    refreshed address book cache from system"
+else
+  echo "    could not read system address book directly (expected on automated runs); using cached copy if available"
+fi
+shopt -s nullglob
+for ab_src in "${ADDRESSBOOK_SRC_BASE}/Sources"/*/AddressBook-v22.abcddb; do
+  ab_source_id=$(basename "$(dirname "${ab_src}")")
+  mkdir -p "${ADDRESSBOOK_CACHE_DIR}/Sources/${ab_source_id}"
+  _refresh_one_addressbook_source \
+    "${ab_src}" "${ADDRESSBOOK_CACHE_DIR}/Sources/${ab_source_id}/AddressBook-v22.abcddb"
+done
+shopt -u nullglob
+
+# ---- step 3: export straight into this run's own timestamped folder --------
 # -p and -r point at two different directories (chat.db lives under
 # WorkingDir/snapshots/<stamp>, but Attachments/StickerCache live under
 # "iMessageExports"), so both are given as absolute paths.
@@ -252,6 +313,15 @@ echo "    using snapshot: ${SNAP_DIR}/chat.db"
 # inside the synced folder rather than being duplicated into a copy that
 # only exists on this Mac.
 #
+# -n points imessage-exporter at the SAME cached Address Book copy step 2
+# just refreshed, instead of letting it fall back to its own automatic
+# detection of the live system path -- which would hit the identical TCC
+# restriction on an automated run that everything else here already works
+# around. Only added if that cache file actually exists yet (e.g. this
+# could be the very first run, before anything has ever successfully
+# refreshed it); if it doesn't, this is simply omitted and imessage-exporter
+# falls back to its own default behavior, exactly as before this change.
+#
 # Output goes directly into RUN_DIR, timestamped the same way as the DB
 # snapshot -- no separate staging/exports folder anymore, and no reliance
 # on imessage-exporter's own append-vs-overwrite behavior for an
@@ -259,11 +329,14 @@ echo "    using snapshot: ${SNAP_DIR}/chat.db"
 # second, imessage-exporter always starts writing into a brand new, empty
 # folder, full stop.
 echo
-echo "==> [2/2] Exporting messages (${START_DATE:-<full history>} onward) into ${RUN_DIR}..."
+echo "==> [3/3] Exporting messages (${START_DATE:-<full history>} onward) into ${RUN_DIR}..."
 mkdir -p "${RUN_DIR}"
 EXPORTER_ARGS=(-f html -c disabled -p "${SNAP_DIR}/chat.db" -r "${LIVE_ARCHIVE}" -a macOS -o "${RUN_DIR}")
 if [[ -n "${START_DATE}" ]]; then
   EXPORTER_ARGS+=(-s "${START_DATE}")
+fi
+if [[ -f "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb" ]]; then
+  EXPORTER_ARGS+=(-n "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb")
 fi
 imessage-exporter "${EXPORTER_ARGS[@]}"
 
@@ -301,59 +374,6 @@ PYEOF
 
 RAW_COUNT="$(find "${RUN_DIR}" -maxdepth 1 -name '*.html' | wc -l | tr -d ' ')"
 echo "    ${RAW_COUNT} file(s) in ${RUN_DIR}"
-
-# ---- refresh the Address Book cache the web app reads for contact grouping --
-# Lives inside "iMessageExports/Contacts" now (not WorkingDir) so it's
-# visible from the same mounted volume the web app's container already
-# reads ARCHIVE_ROOT from -- point its ADDRESSBOOK_CACHE_DIR at this same
-# path and it picks this up with no separate mount needed.
-#
-# Refreshed from the live system copy whenever this process can actually
-# read it, then whatever ends up in the cache (freshly updated or not) is
-# just left there for the app to read whenever it next indexes. The live
-# path is TCC-protected: when this script is run by the automated launchd
-# job, the read below will always fail, since Contacts access has no
-# manual-grant path the way Full Disk Access does -- it can only be granted
-# through the system's own runtime consent prompt for an actual Contacts
-# API call, which a plain file read like this never triggers. That failure
-# is expected and harmless here: it just means the cache stays whatever it
-# was last time. Whenever this script instead gets run with access (e.g.
-# manually from Terminal, which already has whatever access you use
-# Contacts.app with), the refresh below succeeds and the cache gets updated
-# as a side effect, with no separate step needed.
-echo
-echo "==> Refreshing Address Book cache..."
-ADDRESSBOOK_CACHE_DIR="${LIVE_ARCHIVE}/Contacts"
-mkdir -p "${ADDRESSBOOK_CACHE_DIR}"
-
-_refresh_one_addressbook_source() {
-  local src="$1" dest="$2" tmp="${2}.tmp.$$"
-  [[ -r "${src}" ]] || return 1
-  cp "${src}" "${tmp}" 2>/dev/null || { rm -f "${tmp}"; return 1; }
-  [[ -f "${src}-wal" ]] && cp "${src}-wal" "${tmp}-wal" 2>/dev/null
-  [[ -f "${src}-shm" ]] && cp "${src}-shm" "${tmp}-shm" 2>/dev/null
-  mv "${tmp}" "${dest}"
-  [[ -f "${tmp}-wal" ]] && mv "${tmp}-wal" "${dest}-wal"
-  [[ -f "${tmp}-shm" ]] && mv "${tmp}-shm" "${dest}-shm"
-  return 0
-}
-
-ADDRESSBOOK_SRC_BASE="$HOME/Library/Application Support/AddressBook"
-if _refresh_one_addressbook_source \
-     "${ADDRESSBOOK_SRC_BASE}/AddressBook-v22.abcddb" \
-     "${ADDRESSBOOK_CACHE_DIR}/AddressBook-v22.abcddb"; then
-  echo "    refreshed address book cache from system"
-else
-  echo "    could not read system address book directly (expected on automated runs); using cached copy if available"
-fi
-shopt -s nullglob
-for ab_src in "${ADDRESSBOOK_SRC_BASE}/Sources"/*/AddressBook-v22.abcddb; do
-  ab_source_id=$(basename "$(dirname "${ab_src}")")
-  mkdir -p "${ADDRESSBOOK_CACHE_DIR}/Sources/${ab_source_id}"
-  _refresh_one_addressbook_source \
-    "${ab_src}" "${ADDRESSBOOK_CACHE_DIR}/Sources/${ab_source_id}/AddressBook-v22.abcddb"
-done
-shopt -u nullglob
 
 # ---- attachments: handled entirely by step 1 -------------------------------
 # With -c disabled, imessage-exporter references attachments in place rather
