@@ -554,6 +554,53 @@ PYEOF
 # pipeline ever ran, not just what got captured in a past export.
 
 echo
+
+# ---- attachment filename sanitization --------------------------------------
+# Nextcloud (and other sync tools) reject filenames containing certain
+# characters that are valid on macOS but not universally portable: colon,
+# pipe, and backslash.
+#
+# Only THIS run's export folder is ever checked, never any prior one --
+# and that's sufficient, not just convenient: sanitizing runs here, at
+# the END of this run, before the NEXT run's export step ever happens.
+# By the time that next run's imessage-exporter invocation generates its
+# own fresh HTML, any attachment this step renamed is already renamed on
+# disk -- so that fresh HTML naturally references the sanitized name from
+# the moment it's written, for anything overlapping with a previous run
+# included. There's nothing left in an older, already-processed folder
+# that this step could ever need to go back and fix.
+#
+# See sanitize_attachment_filenames.py's own --html-dir documentation for
+# why scoping to a specific folder is safe in the first place: it only
+# ever renames an attachment that's ACTUALLY referenced by the html_dirs
+# being checked, so nothing outside this run can be touched by it. An
+# attachment whose bad character is in an ancestor DIRECTORY name rather
+# than its own filename is skipped with a warning in this mode -- see
+# that script's own --help for why, and run it standalone (no --html-dir)
+# for a one-time full sweep if that ever shows up.
+#
+# The script also maintains its own small rename log at the top of
+# iMessageExports/ (.attachment_rename_log.json) to recognize and clean
+# up a bad-named duplicate that reappears after this run's own attachment
+# sync (step 1, above) pulls again from the live source -- that source is
+# never modified by this step, so without the log, the exact same bad
+# name would otherwise get copied back in and re-flagged on every single
+# future run, forever.
+SANITIZE_SCRIPT="${WORKING_DIR}/sanitize_attachment_filenames.py"
+if [[ -f "${SANITIZE_SCRIPT}" ]]; then
+  echo
+  echo "==> Sanitizing attachment filenames (this run only)..."
+  SANITIZE_ARGS=("${LIVE_ARCHIVE}" --html-dir "${RUN_DIR}")
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    SANITIZE_ARGS+=(--dry-run)
+  fi
+  python3 "${SANITIZE_SCRIPT}" "${SANITIZE_ARGS[@]}"
+else
+  echo
+  echo "    (skipping attachment filename sanitization: ${SANITIZE_SCRIPT} not found)"
+fi
+
+echo
 echo "    next run will start from $(date -j -v-1d -f "%Y-%m-%d" "$(basename "${SNAP_DIR}" | cut -c1-10)" +%Y-%m-%d) (derived from snapshots/$(basename "${SNAP_DIR}"))"
 
 echo
