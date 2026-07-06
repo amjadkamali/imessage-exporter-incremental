@@ -231,7 +231,14 @@ echo "==> [1/3] Snapshotting chat.db (read-only) and syncing attachments..."
 # below reference them in place -- and since this is the folder actually
 # being synced (e.g. to Nextcloud), the referenced files travel with it
 # instead of only existing on this one Mac.
-"${SNAPSHOT_SCRIPT}" "${SNAPSHOT_ROOT}" "${LIVE_ARCHIVE}"
+# Third argument, if it exists yet, is the exclude-list sanitize_attachment_
+# filenames.py writes at the end of ITS OWN run (see step 3 below) --
+# whatever bad filenames it's ever sanitized, so this run's attachment sync
+# never copies one of them back in from the live source. Doesn't exist on
+# a first run, which is fine: imessage-snapshot.sh only passes --exclude-from
+# to rsync when the file is actually there.
+ATTACHMENT_EXCLUDE_FILE="${LIVE_ARCHIVE}/.attachment_rsync_excludes.txt"
+"${SNAPSHOT_SCRIPT}" "${SNAPSHOT_ROOT}" "${LIVE_ARCHIVE}" "${ATTACHMENT_EXCLUDE_FILE}"
 
 # Find the snapshot subdirectory that command just created. imessage-snapshot.sh
 # generates its own STAMP internally; newest one sorts last lexicographically.

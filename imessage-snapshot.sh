@@ -11,9 +11,12 @@
 # living in the WAL are included). SQLite reassembles them automatically
 # the next time the *copy* is opened — the source is untouched.
 #
-# Usage:  ./imessage-snapshot.sh [destination_root] [shared_attachment_root]
+# Usage:  ./imessage-snapshot.sh [destination_root] [shared_attachment_root] [exclude_from_file]
 # Default destination root: ~/imessage-snapshots
 # Default shared attachment root: same as destination_root, if not given
+# exclude_from_file: optional path to an rsync --exclude-from file, e.g. a
+#   list of previously-sanitized bad filenames that should never be synced
+#   back in from the live source. Omitted entirely if not given.
 #
 set -euo pipefail
 
@@ -35,6 +38,16 @@ SNAP="${DEST_ROOT}/${STAMP}"
 SHARED_ROOT="${2:-${DEST_ROOT}}"
 SHARED_ATTACH="${SHARED_ROOT}/Attachments"
 SHARED_STICKERS="${SHARED_ROOT}/StickerCache"
+# Optional: a file of rsync exclude patterns, one per line, relative to
+# whichever of SRC_ATTACH/SRC_STICKERS is being synced (rsync matches a
+# pattern containing "/" against the path relative to the transfer's own
+# source root -- here, SRC_ATTACH/ or SRC_STICKERS/ themselves, because of
+# the trailing slash on each rsync source below). The same file is passed
+# to both Attachments and StickerCache syncs below; a pattern only ever
+# matches a real file if it happens to exist at that relative path within
+# that particular sync, so passing the combined list to both is harmless
+# even though most entries will only be relevant to one or the other.
+EXCLUDE_FROM="${3:-}"
 
 # ---- preflight -------------------------------------------------------------
 if [[ ! -f "${SRC_DB}" ]]; then
@@ -76,7 +89,12 @@ if [[ -d "${SRC_ATTACH}" ]]; then
   echo "==> Syncing Attachments into shared store: ${SHARED_ATTACH}"
   echo "    (additive; changed files updated; nothing ever deleted)"
   mkdir -p "${SHARED_ATTACH}"
-  rsync -a "${SRC_ATTACH}/" "${SHARED_ATTACH}/"
+  RSYNC_ATTACH_ARGS=(-a)
+  if [[ -n "${EXCLUDE_FROM}" && -f "${EXCLUDE_FROM}" ]]; then
+    echo "    (excluding previously-sanitized bad filenames listed in ${EXCLUDE_FROM})"
+    RSYNC_ATTACH_ARGS+=(--exclude-from="${EXCLUDE_FROM}")
+  fi
+  rsync "${RSYNC_ATTACH_ARGS[@]}" "${SRC_ATTACH}/" "${SHARED_ATTACH}/"
 else
   echo "    WARNING: no Attachments folder found at ${SRC_ATTACH}" >&2
 fi
@@ -86,7 +104,11 @@ fi
 if [[ -d "${SRC_STICKERS}" ]]; then
   echo "==> Syncing StickerCache into shared store: ${SHARED_STICKERS}"
   mkdir -p "${SHARED_STICKERS}"
-  rsync -a "${SRC_STICKERS}/" "${SHARED_STICKERS}/"
+  RSYNC_STICKERS_ARGS=(-a)
+  if [[ -n "${EXCLUDE_FROM}" && -f "${EXCLUDE_FROM}" ]]; then
+    RSYNC_STICKERS_ARGS+=(--exclude-from="${EXCLUDE_FROM}")
+  fi
+  rsync "${RSYNC_STICKERS_ARGS[@]}" "${SRC_STICKERS}/" "${SHARED_STICKERS}/"
 else
   echo "    (no StickerCache folder at ${SRC_STICKERS}; skipping)"
 fi
@@ -134,11 +156,27 @@ if [[ -d "${SHARED_ATTACH}" || -d "${SHARED_STICKERS}" ]]; then
   echo "==> Auditing every referenced attachment against the shared store..."
   # Python does the join AND the on-disk existence/size test, so both
   # failure modes are classified in one read-only pass.
-  AUDIT_OUT="$(python3 - "${SNAP}/chat.db" "${SHARED_ATTACH}" "${SNAP}/attachment-audit.json" "${SHARED_STICKERS}" << 'PYEOF'
+  AUDIT_OUT="$(python3 - "${SNAP}/chat.db" "${SHARED_ATTACH}" "${SNAP}/attachment-audit.json" "${SHARED_STICKERS}" "${EXCLUDE_FROM}" << 'PYEOF'
 import sqlite3, sys, os, json, datetime
 from collections import defaultdict
 db_path, shared, audit_json = sys.argv[1], sys.argv[2], sys.argv[3]
 shared_stickers = sys.argv[4] if len(sys.argv) > 4 else ""
+exclude_from = sys.argv[5] if len(sys.argv) > 5 else ""
+
+# Paths sanitize_attachment_filenames.py has ever renamed away, relative to
+# their own attachment root (e.g. "ab/guid123/photo:1.jpg") -- same file
+# already handed to rsync's --exclude-from above, reused here for a
+# different purpose. A file recorded at one of these paths in chat.db will
+# NEVER be found on disk again once excluded, by design -- that's not the
+# same failure mode as a genuinely missing/wiped attachment, so it gets its
+# own category rather than being counted as "missing" (which would
+# otherwise falsely alarm on every single attachment this script has ever
+# successfully sanitized, forever, on every future run).
+known_sanitized = set()
+if exclude_from and os.path.isfile(exclude_from):
+    with open(exclude_from) as fh:
+        known_sanitized = set(line.strip() for line in fh if line.strip())
+
 try:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 except Exception as e:
@@ -213,7 +251,17 @@ for chat_name, transfer_name, stored_path, msg_date in rows:
     rec = {"chat": chat, "file": label, "sent": sent,
            "tail": tail, "stored_path": stored_path}
     if path is None or not os.path.exists(path):
-        missing_by_chat[chat].append((sent, label)); missing_detail.append(rec); n_missing += 1
+        if tail in known_sanitized:
+            # Deliberately not tracked as its own category anywhere in the
+            # audit -- sanitize_attachment_filenames.py already renamed
+            # this on purpose and excluded the old name from syncing, so
+            # it will never be found under this path again, by design.
+            # That's not the kind of problem this audit exists to catch,
+            # so it's simply counted the same as anything else confirmed
+            # fine, rather than surfaced as a distinct thing to look at.
+            n_ok += 1
+        else:
+            missing_by_chat[chat].append((sent, label)); missing_detail.append(rec); n_missing += 1
     elif os.path.getsize(path) == 0:
         zero_by_chat[chat].append((sent, label)); zero_detail.append(rec); n_zero += 1
     else:

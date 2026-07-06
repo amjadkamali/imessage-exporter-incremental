@@ -258,7 +258,7 @@ def build_scoped_rename_plan(export_root, referenced_paths):
 
 
 def rewrite_html_references(export_root, attachment_root, plan, original_files, dry_run,
-                             html_dirs=None, extra_replacements=None):
+                             html_dirs=None):
     """
     For every .html file under export_root (or, if html_dirs is given,
     only under those specific directories), replace any occurrence of an
@@ -284,25 +284,13 @@ def rewrite_html_references(export_root, attachment_root, plan, original_files, 
     component at a time and hoping sequential substring replacements
     happen to combine correctly is fragile and isn't relied on here.
 
-    original_files is every leaf file's path relative to attachment_root,
-    captured BEFORE any renames happened (build_rename_plan doesn't
-    rename anything itself, so a walk taken any time before
-    apply_rename_plan runs still reflects original names).
-
-    extra_replacements, when given, is a list of (old, new) path strings
-    ALREADY fully resolved relative to export_root, added alongside
-    whatever plan implies. This covers a reference to a name that was
-    renamed in a PRIOR run rather than this one: imessage-exporter
-    regenerates each run's HTML from chat.db's own recorded attachment
-    path, which always points at the attachment's original location and
-    has no idea a local rename ever happened here, so a message
-    re-exported later (the sync pipeline's own one-day overlap window,
-    or any other reason the same attachment gets referenced again) can
-    legitimately reference an old name again even though nothing new
-    needs physically renaming for it -- the sanitized file already
-    exists from before, and the reference just needs pointing at it,
-    not routed through rename-collision logic meant for genuinely new
-    candidates.
+    original_files is every leaf file's path relative to attachment_root.
+    Note this does NOT need the file to still exist on disk: the
+    replacement is derived purely from applying plan's string
+    substitutions to each path, so a reference to a name whose file was
+    excluded from syncing (see load_exclude_list()) still gets rewritten
+    correctly -- confirmed directly, with a reference to a name that was
+    never even copied locally.
 
     html_dirs, when given, restricts WHICH .html files get scanned and
     rewritten to only those under the listed directories. When html_dirs
@@ -314,7 +302,7 @@ def rewrite_html_references(export_root, attachment_root, plan, original_files, 
     """
     rel_attachment_root = attachment_root.relative_to(export_root)
 
-    replacements = list(extra_replacements) if extra_replacements else []
+    replacements = []
     for rel_file in original_files:
         new_rel_file = sanitized_relative_path(rel_file, plan)
         if new_rel_file != rel_file:
@@ -518,6 +506,71 @@ def record_renames(export_root, attachment_root, plan, original_files, log):
             log[old_full] = new_full
 
 
+EXCLUDE_LIST_FILENAME = '.attachment_rsync_excludes.txt'
+
+
+def load_exclude_list(export_root):
+    """
+    Load the plain-text list of bad attachment names ever sanitized under
+    export_root, one path (relative to its own attachment root -- e.g.
+    "photo:1.jpg" or "sub/photo:1.jpg", not "Attachments/photo:1.jpg")
+    per line.
+
+    This is the only persistent state this script keeps, and it exists
+    for exactly one purpose: handing to rsync's --exclude-from on the
+    NEXT sync, so a bad name is never copied back in from the live
+    attachment source in the first place. It is deliberately NOT a
+    rename mapping (old name -> new name) the way an earlier version of
+    this script kept -- that turned out to be unnecessary complexity.
+    sanitize_component() is a pure function: the same bad name always
+    sanitizes to the same result, so nothing needs to be "remembered" to
+    correctly rewrite an HTML reference -- it can always be recomputed
+    fresh from the bad string itself, regardless of whether the file it
+    once named actually exists on disk. Confirmed directly: a reference
+    to a bad name whose file was never even present got rewritten
+    correctly with no log involved at all. The only thing that genuinely
+    can't be reconstructed after the fact is "should rsync exclude this
+    name" -- there's no way to derive that from a filename string alone,
+    since plenty of legitimately-still-bad names might exist that were
+    simply never sanitized yet -- hence keeping a list for that one job,
+    and only that job.
+
+    Returns a set of strings; empty if no list exists yet (first run, or
+    an export root that predates this feature).
+    """
+    list_path = export_root / EXCLUDE_LIST_FILENAME
+    if not list_path.is_file():
+        return set()
+    try:
+        return set(
+            line.strip() for line in list_path.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        )
+    except OSError:
+        return set()
+
+
+def save_exclude_list(export_root, excludes, dry_run):
+    if dry_run:
+        return
+    list_path = export_root / EXCLUDE_LIST_FILENAME
+    list_path.write_text('\n'.join(sorted(excludes)) + '\n', encoding='utf-8')
+
+
+def record_excluded_names(attachment_root, export_root, plan, excludes):
+    """
+    Add every OLD (bad) name plan covers to excludes, as a path relative
+    to attachment_root itself -- the form rsync's --exclude-from expects
+    when excluding relative to whichever attachment source directory is
+    actually being synced (verify this matches imessage-snapshot.sh's
+    own rsync invocation once wiring this list up on that side).
+    """
+    for rel_dir, local_plan in plan.items():
+        for old_name in local_plan:
+            rel_path = (rel_dir / old_name) if str(rel_dir) != '.' else Path(old_name)
+            excludes.add(str(rel_path))
+
+
 def run_full_sweep(export_root, dry_run):
     """
     Original, unscoped behavior: walk every Attachments/StickerCache
@@ -532,8 +585,7 @@ def run_full_sweep(export_root, dry_run):
         print(f"No Attachments/StickerCache directories found under {export_root}.")
         return
 
-    log = load_rename_log(export_root)
-    heal_resynced_duplicates(export_root, log, dry_run)
+    excludes = load_exclude_list(export_root)
 
     total_renamed = 0
     total_html_changed = 0
@@ -553,7 +605,7 @@ def run_full_sweep(export_root, dry_run):
 
         renamed = apply_rename_plan(attachment_root, plan, dry_run)
         total_renamed += renamed
-        record_renames(export_root, attachment_root, plan, original_files, log)
+        record_excluded_names(attachment_root, export_root, plan, excludes)
 
         html_changed, refs_updated = rewrite_html_references(
             export_root, attachment_root, plan, original_files, dry_run
@@ -561,7 +613,7 @@ def run_full_sweep(export_root, dry_run):
         total_html_changed += html_changed
         total_refs_updated += refs_updated
 
-    save_rename_log(export_root, log, dry_run)
+    save_exclude_list(export_root, excludes, dry_run)
 
     print(f"\n{'[dry-run] ' if dry_run else ''}Done: {total_renamed} file(s)/folder(s) renamed, "
           f"{total_refs_updated} reference(s) updated across {total_html_changed} HTML file(s).")
@@ -576,6 +628,15 @@ def run_scoped(export_root, html_dirs, dry_run):
     build_scoped_rename_plan()'s own docstring for why that pairing
     (attachment candidates always derived FROM the same html_dirs being
     rewritten) is what keeps this safe.
+
+    Every referenced path is handled uniformly here, whether or not its
+    file actually exists on disk -- rsync excluding an already-sanitized
+    bad name (see load_exclude_list()) means a later run's HTML can
+    legitimately reference a name whose file was never even copied, and
+    that's fine: build_scoped_rename_plan() only needs the STRING to
+    detect a bad character and compute its sanitized replacement, and
+    apply_rename_plan() already skips gracefully when there's nothing on
+    disk to actually rename.
     """
     html_files = []
     for d in html_dirs:
@@ -585,36 +646,14 @@ def run_scoped(export_root, html_dirs, dry_run):
         print(f"No .html files found under: {', '.join(html_dirs)}")
         return
 
-    log = load_rename_log(export_root)
-    heal_resynced_duplicates(export_root, log, dry_run)
-
     referenced_paths = extract_referenced_paths(html_files)
     if not referenced_paths:
         print("No attachment references found in the given HTML files.")
-        save_rename_log(export_root, log, dry_run)
         return
 
-    # Split into paths this script has ALREADY renamed in some prior run
-    # vs genuinely new candidates. This split matters: imessage-exporter
-    # regenerates each run's HTML straight from chat.db's own recorded
-    # attachment path, which always points at the original location and
-    # has no idea a local rename ever happened -- so a reference to an
-    # already-renamed name can legitimately reappear (the sync pipeline's
-    # own overlap window, or any other reason the same attachment gets
-    # referenced again) even though there's nothing left to physically
-    # rename for it; the sanitized file already exists from before.
-    # Feeding an already-logged path into build_scoped_rename_plan()
-    # anyway would misread "old name doesn't exist, new name is already
-    # taken" as a genuine collision needing a fresh "__2" suffix, when
-    # really the reference just needs pointing at the file that's
-    # already there. Confirmed directly: an earlier version did exactly
-    # that on a second run, producing a spurious "__2"-suffixed name for
-    # a file that only needed its HTML reference reattached, not a new
-    # rename.
-    already_logged = {ref: log[ref] for ref in referenced_paths if ref in log}
-    new_candidates = referenced_paths - already_logged.keys()
+    excludes = load_exclude_list(export_root)
 
-    plans_by_root, skipped = build_scoped_rename_plan(export_root, new_candidates) if new_candidates else ({}, [])
+    plans_by_root, skipped = build_scoped_rename_plan(export_root, referenced_paths)
 
     if skipped:
         print(f"WARNING: {len(skipped)} referenced attachment(s) skipped -- "
@@ -624,20 +663,15 @@ def run_scoped(export_root, html_dirs, dry_run):
         for s in skipped:
             print(f"    {s}")
 
-    attachment_roots_touched = set(plans_by_root.keys())
-    attachment_roots_touched.update(export_root / Path(p).parts[0] for p in already_logged)
-
-    if not attachment_roots_touched:
+    if not plans_by_root:
         print("No problematic filenames found among the referenced attachments.")
-        save_rename_log(export_root, log, dry_run)
         return
 
     total_renamed = 0
     total_html_changed = 0
     total_refs_updated = 0
 
-    for attachment_root in attachment_roots_touched:
-        plan = plans_by_root.get(attachment_root, {})
+    for attachment_root, plan in plans_by_root.items():
         print(f"\n=== {attachment_root.relative_to(export_root)} (scoped) ===")
 
         # original_files here is deliberately just the files THIS plan
@@ -649,24 +683,18 @@ def run_scoped(export_root, html_dirs, dry_run):
             for old_name in local_plan
         ]
 
-        if plan:
-            renamed = apply_rename_plan(attachment_root, plan, dry_run)
-            total_renamed += renamed
-            record_renames(export_root, attachment_root, plan, original_files, log)
-
-        this_root_extra = [
-            (old, new) for old, new in already_logged.items()
-            if (export_root / Path(old).parts[0]) == attachment_root
-        ]
+        renamed = apply_rename_plan(attachment_root, plan, dry_run)
+        total_renamed += renamed
+        record_excluded_names(attachment_root, export_root, plan, excludes)
 
         html_changed, refs_updated = rewrite_html_references(
             export_root, attachment_root, plan, original_files, dry_run,
-            html_dirs=html_dirs, extra_replacements=this_root_extra
+            html_dirs=html_dirs
         )
         total_html_changed += html_changed
         total_refs_updated += refs_updated
 
-    save_rename_log(export_root, log, dry_run)
+    save_exclude_list(export_root, excludes, dry_run)
 
     print(f"\n{'[dry-run] ' if dry_run else ''}Done: {total_renamed} file(s) renamed, "
           f"{total_refs_updated} reference(s) updated across {total_html_changed} HTML file(s).")
