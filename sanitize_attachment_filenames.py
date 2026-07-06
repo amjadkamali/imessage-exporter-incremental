@@ -2,21 +2,27 @@
 """
 sanitize_attachment_filenames.py
 
-Nextcloud (and other sync tools) reject filenames containing certain
-characters that are valid on macOS but not universally portable: colon,
-pipe, and backslash. This script finds every attachment or sticker file
-under an iMessage export root whose name contains one of these, renames
-it to a sanitized form, and rewrites every reference to the old name
-inside every exported .html file -- so renaming doesn't silently break
-attachment display in the viewer.
+Some filename characters cause real problems downstream: Nextcloud (and
+other sync tools) reject colon, pipe, and backslash, which are valid on
+macOS but not universally portable; and rsync's own exclude-pattern
+matching treats *, ?, [, and ] as wildcard metacharacters, so a filename
+that happens to contain one of THOSE literally can silently break the
+--exclude-from mechanism this script's own sync integration depends on
+(confirmed directly: a real attachment name containing a literal "["
+caused its exclude entry to be misparsed as an incomplete character
+class rather than literal text). This script finds every attachment or
+sticker file under an iMessage export root whose name contains any of
+these, renames it to a sanitized form, and rewrites every reference to
+the old name inside every exported .html file -- so renaming doesn't
+silently break attachment display in the viewer.
 
-Each distinct problematic character maps to a DIFFERENT number of dashes
-(":" -> "---", "|" -> "--", "\\" -> "-") rather than collapsing everything
-to one generic placeholder. Two benefits: which original character was
-present is recoverable just by counting a dash run (useful if you ever
-need to debug or reverse this), and two DIFFERENT original characters can
-never collide into an identical replacement the way a single "_" for
-everything easily could.
+Every one of these characters maps uniformly to a single "-", with no
+per-character dash count to keep track of. Two different original
+characters can end up producing the identical sanitized name this way,
+but that's deliberately not disambiguated with a suffix: attachments are
+GUID-named, so a genuine collision is negligible, and apply_rename_plan()
+already treats a resulting collision as the same file rather than trying
+to tell them apart.
 
 Every character is checked per path COMPONENT (one directory or file name
 at a time), not against a full path string as a single unit -- this is
@@ -42,25 +48,59 @@ import re
 import sys
 from pathlib import Path
 
-CHAR_TO_DASHES = {
-    ':': '---',
-    '|': '--',
-    '\\': '-',
-}
+# Every character here maps uniformly to a single "-" (see
+# sanitize_component()) -- no distinct dash-count-per-character scheme to
+# keep track of. Covers two genuinely different problems with one list:
+#   - characters Nextcloud (and other sync tools) reject, or that are
+#     reserved on Windows: : | \ < >
+#   - rsync's OWN wildcard metacharacters: * ? [ ] -- rsync decides
+#     whether a pattern is literal text or a wildcard expression by
+#     checking for the presence of any of these ANYWHERE in the pattern,
+#     with no way to reliably escape just one occurrence without risking
+#     the surrounding pattern being misparsed as well. Confirmed directly
+#     against a real, reported case: a filename containing a literal "["
+#     caused its --exclude-from entry to be silently misinterpreted as an
+#     (incomplete, since it happened to have no matching "]") character
+#     class rather than literal text, so the exclude never matched and
+#     the bad name kept getting re-synced from the live source every run.
+#     Replacing every one of these with a wildcard in the exclude pattern
+#     (see to_exclude_pattern()) sidesteps needing to escape any of them
+#     at all: a "?" wildcard is never itself ambiguous the way an escaped
+#     literal "[" or "*" could still be.
+#
+# Deliberately NOT included: a literal double-quote ("). Every other
+# character here is just an ordinary character as far as HTML is
+# concerned, but a quote is the actual attribute delimiter in
+# src="..."/href="...", not just a filesystem-unfriendly character --
+# handling it correctly would need real HTML-aware parsing (an unescaped
+# quote in the raw filename truncates ATTACHMENT_REF_RE's own match at
+# that point, extracting a shorter, wrong path) plus html.unescape()
+# before ever comparing an extracted path against disk (a properly
+# HTML-escaped "&quot;" in the extracted string will never textually
+# equal the literal quote character the real file actually has). Both
+# confirmed directly. Meaningfully bigger than a one-line character-set
+# change for a character that's likely rare in real attachment names
+# compared to the others here, so left unhandled for now rather than
+# silently mishandled.
+BAD_CHARS = frozenset(':|\\<>?*[]')
 
 ATTACHMENT_DIR_NAMES = ('attachments', 'Attachments', 'StickerCache')
 
 
 def sanitize_component(name):
     """
-    Replace every occurrence of a target character in a single path
-    component (a directory or file name, never a full path) with its
-    assigned dash sequence. Returns (new_name, changed).
+    Replace every occurrence of any character in BAD_CHARS, in a single
+    path component (a directory or file name, never a full path), with a
+    single "-". Two different original characters can end up mapping to
+    the same result this way, but that's fine: attachments are
+    GUID-named, so a genuine collision is negligible, and
+    apply_rename_plan() already treats a resulting name collision as the
+    same file rather than trying to disambiguate it. Returns (new_name, changed).
     """
     original = name
-    for ch, dashes in CHAR_TO_DASHES.items():
+    for ch in BAD_CHARS:
         if ch in name:
-            name = name.replace(ch, dashes)
+            name = name.replace(ch, '-')
     return name, (name != original)
 
 
@@ -240,7 +280,7 @@ def build_scoped_rename_plan(export_root, referenced_paths):
 
     for (attachment_root, rel_dir), filenames in by_dir.items():
         # Bad character in an ANCESTOR directory component -> skip, warn.
-        if any(any(ch in part for ch in CHAR_TO_DASHES) for part in rel_dir.parts):
+        if any(any(ch in part for ch in BAD_CHARS) for part in rel_dir.parts):
             for fn in filenames:
                 skipped_ancestor.append(str(Path(attachment_root.name) / rel_dir / fn))
             continue
@@ -557,6 +597,35 @@ def save_exclude_list(export_root, excludes, dry_run):
     list_path.write_text('\n'.join(sorted(excludes)) + '\n', encoding='utf-8')
 
 
+def to_exclude_pattern(name):
+    """
+    Turn a bad filename into an rsync exclude pattern by replacing every
+    character in BAD_CHARS with "?" (rsync's single-any-character
+    wildcard, never matching "/") rather than keeping the literal
+    character in the pattern. "?" specifically, not "*": each occurrence
+    stands in for exactly one original character, and "?" matches
+    exactly one character, so it can't accidentally widen the match to
+    something longer than the original name the way "*" (zero-or-more)
+    could.
+
+    This isn't just a precaution -- it's the fix for a confirmed,
+    reproduced failure mode. rsync decides whether a whole pattern is
+    literal text or a wildcard expression by checking for the presence
+    of *, ?, or [ anywhere in it. A real attachment name containing a
+    literal "[" (with no matching "]" anywhere in it) caused its
+    exclude-from entry to be misparsed as an incomplete character-class
+    expression rather than literal text, so the exclude silently never
+    matched and the bad name kept getting re-synced from the live source
+    on every run. Replacing every BAD_CHARS occurrence with "?" avoids
+    this category of problem entirely: none of rsync's own wildcard
+    metacharacters are ever left literally in the pattern to be
+    misinterpreted, since they're covered by BAD_CHARS themselves.
+    """
+    for ch in BAD_CHARS:
+        name = name.replace(ch, '?')
+    return name
+
+
 def record_excluded_names(attachment_root, export_root, plan, excludes):
     """
     Add every OLD (bad) name plan covers to excludes, as a path relative
@@ -564,10 +633,14 @@ def record_excluded_names(attachment_root, export_root, plan, excludes):
     when excluding relative to whichever attachment source directory is
     actually being synced (verify this matches imessage-snapshot.sh's
     own rsync invocation once wiring this list up on that side).
+
+    Each bad character in the name is written as "?" rather than kept
+    literal -- see to_exclude_pattern()'s own docstring for why.
     """
     for rel_dir, local_plan in plan.items():
         for old_name in local_plan:
-            rel_path = (rel_dir / old_name) if str(rel_dir) != '.' else Path(old_name)
+            pattern_name = to_exclude_pattern(old_name)
+            rel_path = (rel_dir / pattern_name) if str(rel_dir) != '.' else Path(pattern_name)
             excludes.add(str(rel_path))
 
 

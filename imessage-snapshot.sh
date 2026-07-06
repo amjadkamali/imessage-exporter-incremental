@@ -157,7 +157,7 @@ if [[ -d "${SHARED_ATTACH}" || -d "${SHARED_STICKERS}" ]]; then
   # Python does the join AND the on-disk existence/size test, so both
   # failure modes are classified in one read-only pass.
   AUDIT_OUT="$(python3 - "${SNAP}/chat.db" "${SHARED_ATTACH}" "${SNAP}/attachment-audit.json" "${SHARED_STICKERS}" "${EXCLUDE_FROM}" << 'PYEOF'
-import sqlite3, sys, os, json, datetime
+import sqlite3, sys, os, json, datetime, fnmatch
 from collections import defaultdict
 db_path, shared, audit_json = sys.argv[1], sys.argv[2], sys.argv[3]
 shared_stickers = sys.argv[4] if len(sys.argv) > 4 else ""
@@ -168,14 +168,25 @@ exclude_from = sys.argv[5] if len(sys.argv) > 5 else ""
 # already handed to rsync's --exclude-from above, reused here for a
 # different purpose. A file recorded at one of these paths in chat.db will
 # NEVER be found on disk again once excluded, by design -- that's not the
-# same failure mode as a genuinely missing/wiped attachment, so it gets its
-# own category rather than being counted as "missing" (which would
-# otherwise falsely alarm on every single attachment this script has ever
-# successfully sanitized, forever, on every future run).
-known_sanitized = set()
+# same failure mode as a genuinely missing/wiped attachment, so it's
+# counted the same as anything else confirmed fine rather than alarming
+# on every single attachment this script has ever successfully sanitized,
+# forever, on every future run.
+#
+# Loaded as a LIST of fnmatch patterns, not a set for exact membership:
+# each bad character in an entry is written as "?" (rsync's
+# single-any-character wildcard) rather than the literal character, so
+# matching a real tail against these patterns needs wildcard-aware
+# comparison (fnmatch, same "?"/"*" semantics as a shell glob) -- a
+# plain "in a set" check would never match anything here, since the
+# pattern and the real tail are no longer identical strings by design.
+known_sanitized_patterns = []
 if exclude_from and os.path.isfile(exclude_from):
     with open(exclude_from) as fh:
-        known_sanitized = set(line.strip() for line in fh if line.strip())
+        known_sanitized_patterns = [line.strip() for line in fh if line.strip()]
+
+def is_known_sanitized(tail):
+    return any(fnmatch.fnmatch(tail, pat) for pat in known_sanitized_patterns)
 
 try:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -251,7 +262,7 @@ for chat_name, transfer_name, stored_path, msg_date in rows:
     rec = {"chat": chat, "file": label, "sent": sent,
            "tail": tail, "stored_path": stored_path}
     if path is None or not os.path.exists(path):
-        if tail in known_sanitized:
+        if is_known_sanitized(tail):
             # Deliberately not tracked as its own category anywhere in the
             # audit -- sanitize_attachment_filenames.py already renamed
             # this on purpose and excluded the old name from syncing, so
